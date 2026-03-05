@@ -30,12 +30,11 @@ import (
 )
 
 const (
-	WWWAuthenticateHeader  = "WWW-Authenticate"
-	AuthMethodBearer       = "Bearer resource_metadata="
-	WellKnownPath          = ".well-known/oauth-protected-resource"
-	McpSessionHeader       = "mcp-session-id"
-	MetadataKeyAuthSuccess = "auth.success"
-	MetadataKeyAuthMethod  = "auth.method"
+	WWWAuthenticateHeader = "WWW-Authenticate"
+	AuthMethodBearer      = "Bearer resource_metadata="
+	WellKnownPath         = ".well-known/oauth-protected-resource"
+	McpSessionHeader      = "mcp-session-id"
+	AuthType              = "mcp/oauth"
 )
 
 type McpAuthPolicy struct{}
@@ -163,6 +162,12 @@ func (p *McpAuthPolicy) handleAuth(ctx *policy.RequestContext, params map[string
 	reqAction := jwtPolicy.OnRequest(ctx, params)
 	if _, ok := reqAction.(policy.ImmediateResponse); ok {
 		slog.Debug("MCP Auth Policy: Authentication failed in JWT Auth Policy, handling failure")
+		// Take ownership of AuthContext: mcp-auth is the effective policy that ran
+		ctx.SharedContext.AuthContext = &policy.AuthContext{
+			Authenticated: false,
+			AuthType:      AuthType,
+			Previous:      ctx.SharedContext.AuthContext,
+		}
 		headers := reqAction.(policy.ImmediateResponse).Headers
 		ir := reqAction.(policy.ImmediateResponse)
 		escapedDesc := ""
@@ -184,13 +189,20 @@ func (p *McpAuthPolicy) handleAuth(ctx *policy.RequestContext, params map[string
 			Body:       reqAction.(policy.ImmediateResponse).Body,
 		}
 	}
+	// Override AuthType to mcp/oauth: mcp-auth is the effective policy that ran
+	if ctx.SharedContext.AuthContext != nil {
+		ctx.SharedContext.AuthContext.AuthType = AuthType
+	}
 	return reqAction
 }
 
 func (p *McpAuthPolicy) handleAuthFailure(ctx *policy.RequestContext, statusCode int, format string, reason any) policy.RequestAction {
 	slog.Debug("MCP Auth Policy: Handling authentication failure", "statusCode", statusCode, "reason", reason)
-	ctx.Metadata[MetadataKeyAuthSuccess] = false
-	ctx.Metadata[MetadataKeyAuthMethod] = "mcpAuth"
+	ctx.SharedContext.AuthContext = &policy.AuthContext{
+		Authenticated: false,
+		AuthType:      AuthType,
+		Previous:      ctx.SharedContext.AuthContext,
+	}
 	var body string
 	headers := map[string]string{
 		"content-type": "application/json",
