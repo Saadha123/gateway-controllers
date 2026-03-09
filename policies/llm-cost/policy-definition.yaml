@@ -1,0 +1,35 @@
+name: llm-cost
+version: v0.1.0
+description: |
+  Calculates the monetary cost of an LLM API call and injects the result as an
+  x-llm-cost response header (value: USD float, e.g. "0.0000423100").
+
+  The policy reads the model name from $.model in the response body, looks it
+  up in an embedded copy of LiteLLM's pricing database, normalises the usage
+  object using a provider-specific calculator, and computes cost using the same
+  formulas as LiteLLM.
+
+  Supported providers: OpenAI, Azure OpenAI, Azure AI Foundry, Anthropic,
+  Gemini (Google AI Studio + Vertex AI), Mistral.
+
+  Notes:
+  - This policy runs in the response phase only. It must appear BEFORE any
+    budget-enforcement policy in the operation's policy chain so the header is
+    set before that policy reads it.
+  - The policy buffers the full response body, which adds latency equal to the
+    full generation time. It is not recommended on streaming (SSE) routes.
+  - If the model name is not found in the pricing database, x-llm-cost is set
+    to 0.0000000000 and a warning is logged. The request is not blocked.
+  - Azure PTU (Provisioned Throughput Unit) deployments are billed hourly, not
+    per token. This policy returns 0 for PTU routes — do not use it for budget
+    enforcement on PTU deployments.
+
+parameters:
+  type: object
+  additionalProperties: false
+  properties: {}
+  required: []
+
+systemParameters:
+  type: object
+  properties: {}
