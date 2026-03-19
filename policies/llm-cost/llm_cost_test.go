@@ -18,6 +18,7 @@ package llmcost
 
 import (
 	"encoding/json"
+	"fmt"
 	"math"
 	"os"
 	"path/filepath"
@@ -1895,6 +1896,68 @@ func TestOnResponse_UnknownModel_NotCalculated(t *testing.T) {
 	body := []byte(`{"model": "totally-unknown-model-xyz", "usage": {"prompt_tokens": 10}}`)
 	ctx := makeResponseContext(body)
 	assertCostMetadata(t, ctx, p.OnResponse(ctx, nil), costStatusNotCalculated, "0.0000000000")
+}
+
+// ---------------------------------------------------------------------------
+// selectCalculator
+// ---------------------------------------------------------------------------
+
+func TestSelectCalculator_KnownProviders(t *testing.T) {
+	cases := []struct {
+		provider string
+		wantType string
+	}{
+		{"openai", "*llmcost.OpenAICalculator"},
+		{"anthropic", "*llmcost.AnthropicCalculator"},
+		{"mistral", "*llmcost.MistralCalculator"},
+		{"gemini", "*llmcost.GeminiCalculator"},
+		{"vertex_ai", "*llmcost.GeminiCalculator"},
+		{"vertex_ai-language-models", "*llmcost.GeminiCalculator"},
+		{"vertex_ai-chat-models", "*llmcost.GeminiCalculator"},
+		{"vertex_ai-code-chat-models", "*llmcost.GeminiCalculator"},
+		{"vertex_ai-vision-models", "*llmcost.GeminiCalculator"},
+		{"vertex_ai-embedding-models", "*llmcost.GeminiCalculator"},
+	}
+	for _, tc := range cases {
+		calc, ok := selectCalculator(tc.provider)
+		if !ok {
+			t.Errorf("provider %q: expected ok=true, got false", tc.provider)
+			continue
+		}
+		if calc == nil {
+			t.Errorf("provider %q: expected non-nil calculator", tc.provider)
+			continue
+		}
+		gotType := fmt.Sprintf("%T", calc)
+		if gotType != tc.wantType {
+			t.Errorf("provider %q: expected %s, got %s", tc.provider, tc.wantType, gotType)
+		}
+	}
+}
+
+func TestSelectCalculator_UnknownProvider(t *testing.T) {
+	calc, ok := selectCalculator("some-unknown-provider")
+	if ok {
+		t.Error("expected ok=false for unknown provider, got true")
+	}
+	if calc != nil {
+		t.Errorf("expected nil calculator for unknown provider, got %T", calc)
+	}
+}
+
+func TestOnResponse_UnsupportedProvider_ZeroCost(t *testing.T) {
+	// Inject a pricing entry whose provider is not handled by any calculator.
+	pm := map[string]ModelPricing{
+		"fake-model": {
+			Provider:           "unsupported-provider",
+			InputCostPerToken:  1e-6,
+			OutputCostPerToken: 2e-6,
+		},
+	}
+	p := &LLMCostPolicy{pricingMap: pm}
+	body := []byte(`{"model": "fake-model", "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15}}`)
+	ctx := makeResponseContext(body)
+	assertCostMetadata(t, ctx, p.OnResponse(ctx, nil), costStatusUnsupportedProvider, "0.0000000000")
 }
 
 // ---------------------------------------------------------------------------

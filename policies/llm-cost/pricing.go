@@ -249,10 +249,13 @@ type providerCalculator interface {
 }
 
 // selectCalculator returns the appropriate calculator for a given provider value.
-func selectCalculator(provider string) providerCalculator {
+// Returns (nil, false) if the provider is not supported.
+func selectCalculator(provider string) (providerCalculator, bool) {
 	switch provider {
+	case "openai":
+		return &OpenAICalculator{}, true
 	case "anthropic":
-		return &AnthropicCalculator{}
+		return &AnthropicCalculator{}, true
 	case "gemini",
 		"vertex_ai",
 		"vertex_ai-language-models",
@@ -260,11 +263,11 @@ func selectCalculator(provider string) providerCalculator {
 		"vertex_ai-code-chat-models",
 		"vertex_ai-vision-models",
 		"vertex_ai-embedding-models":
-		return &GeminiCalculator{}
+		return &GeminiCalculator{}, true
 	case "mistral":
-		return &MistralCalculator{}
-	default: // "openai", "text-completion-openai"
-		return &OpenAICalculator{}
+		return &MistralCalculator{}, true
+	default:
+		return nil, false
 	}
 }
 

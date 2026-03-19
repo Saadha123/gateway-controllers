@@ -35,8 +35,9 @@ const (
 	// This disambiguates x-llm-cost: 0 (which could mean zero cost or a failed calculation).
 	MetadataLLMCostStatus = "x-llm-cost-status"
 
-	costStatusCalculated    = "calculated"
-	costStatusNotCalculated = "not_calculated"
+	costStatusCalculated          = "calculated"
+	costStatusNotCalculated       = "not_calculated"
+	costStatusUnsupportedProvider = "unsupported_provider"
 )
 
 // LLMCostPolicy calculates the cost of an LLM API call from the response body
@@ -129,7 +130,11 @@ func (p *LLMCostPolicy) OnResponse(ctx *policy.ResponseContext, _ map[string]int
 	}
 
 	// Select provider calculator.
-	calc := selectCalculator(pricing.Provider)
+	calc, ok := selectCalculator(pricing.Provider)
+	if !ok {
+		slog.Warn("llm-cost: unsupported provider, setting cost to 0", "provider", pricing.Provider, "model", modelName)
+		return setCostMetadata(ctx, 0.0, costStatusUnsupportedProvider)
+	}
 
 	// Get buffered request body (may be nil for providers that don't need it).
 	var requestBody []byte
