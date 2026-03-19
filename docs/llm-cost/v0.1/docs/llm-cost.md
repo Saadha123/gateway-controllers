@@ -22,7 +22,7 @@ Use this policy when you need to:
 - **Pricing Database**: Model pricing is loaded once at startup from a JSON file shipped with the gateway image.
 - **SharedContext Integration**: Stores the calculated cost in `SharedContext.Metadata` under `x-llm-cost` for use by downstream policies.
 - **Non-Blocking on Failure**: If the model is not found in the pricing database or usage cannot be parsed, the cost is set to `0.0000000000` and the request is not blocked.
-- **Status Metadata**: Sets `x-llm-cost-status` to `calculated` or `not_calculated` to disambiguate a zero cost from a failed calculation.
+- **Status Metadata**: Sets `x-llm-cost-status` to `calculated`, `not_calculated`, or `unsupported_provider` to disambiguate a zero cost from a failed or unsupported calculation.
 
 ## Configuration
 
@@ -87,7 +87,7 @@ spec:
 After each successful response, the policy stores the calculated cost in `SharedContext.Metadata`:
 
 - `x-llm-cost`: USD dollar amount formatted to 10 decimal places (for example, `"0.0000423100"`).
-- `x-llm-cost-status`: `"calculated"` if the cost was computed successfully, or `"not_calculated"` if the model was not found in the pricing database or parsing failed.
+- `x-llm-cost-status`: `"calculated"` if the cost was computed successfully, `"not_calculated"` if the model was not found in the pricing database or parsing failed, or `"unsupported_provider"` if the model's provider has no cost calculator.
 
 ### Example 2: Use with LLM Cost Based Ratelimit
 
@@ -143,5 +143,6 @@ spec:
 
 - The pricing file is loaded once at process startup using a singleton pattern. All APIs and routes that attach this policy share the same pricing data.
 - If the model name is not found in the pricing database, `x-llm-cost` is set to `0.0000000000`, `x-llm-cost-status` is set to `not_calculated`, and a warning is logged. The request is **not** blocked.
+- If the model is found in the pricing database but its provider has no cost calculator, `x-llm-cost` is set to `0.0000000000`, `x-llm-cost-status` is set to `unsupported_provider`, and a warning is logged. The request is **not** blocked.
 - The cost is stored internally only and is never sent to the client as a response header.
 - Supported providers: **OpenAI**, **Anthropic**, **Gemini** (Google AI Studio and Vertex AI), **Mistral**.
