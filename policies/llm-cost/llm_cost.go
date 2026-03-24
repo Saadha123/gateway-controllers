@@ -22,6 +22,7 @@ import (
 	"log/slog"
 	"sync"
 
+	policyv1alpha2 "github.com/wso2/api-platform/sdk/core/policy/v1alpha2"
 	policy "github.com/wso2/api-platform/sdk/gateway/policy/v1alpha"
 )
 
@@ -178,4 +179,92 @@ func setCostMetadata(ctx *policy.ResponseContext, costUSD float64, status string
 	ctx.SharedContext.Metadata[MetadataLLMCost] = fmt.Sprintf("%.10f", costUSD)
 	ctx.SharedContext.Metadata[MetadataLLMCostStatus] = status
 	return policy.UpstreamResponseModifications{}
+}
+
+// OnResponseBody reads the LLM response, looks up model pricing, calculates cost,
+// and stores the result in SharedContext.Metadata.
+func (p *LLMCostPolicy) OnResponseBody(ctx *policyv1alpha2.ResponseContext, _ map[string]interface{}) policyv1alpha2.ResponseAction {
+	if ctx.ResponseBody == nil || !ctx.ResponseBody.Present || len(ctx.ResponseBody.Content) == 0 {
+		slog.Warn("llm-cost: empty or missing response body, skipping cost calculation")
+		return setCostMetadataV2(ctx, 0.0, costStatusNotCalculated)
+	}
+
+	responseBody := ctx.ResponseBody.Content
+
+	// Extract model name from response body.
+	// OpenAI-compatible providers use $.model; Gemini uses $.modelVersion.
+	var probe struct {
+		Model        string `json:"model"`
+		ModelVersion string `json:"modelVersion"`
+	}
+	if err := json.Unmarshal(responseBody, &probe); err != nil {
+		slog.Warn("llm-cost: could not parse response body", "error", err)
+		return setCostMetadataV2(ctx, 0.0, costStatusNotCalculated)
+	}
+	modelName := probe.Model
+	if modelName == "" {
+		modelName = probe.ModelVersion
+	}
+	if modelName == "" {
+		slog.Warn("llm-cost: no model name found in response body ($.model or $.modelVersion)")
+		return setCostMetadataV2(ctx, 0.0, costStatusNotCalculated)
+	}
+
+	// Look up pricing entry.
+	pricing, found := lookupPricing(p.pricingMap, modelName)
+	if !found {
+		slog.Warn("llm-cost: no pricing entry for model, setting cost to 0", "model", modelName)
+		return setCostMetadataV2(ctx, 0.0, costStatusNotCalculated)
+	}
+
+	// Select provider calculator.
+	calc := selectCalculator(pricing.Provider)
+	if calc == nil {
+		slog.Warn("llm-cost: unsupported provider, skipping cost calculation", "provider", pricing.Provider, "model", modelName)
+		return setCostMetadataV2(ctx, 0.0, costStatusNotCalculated)
+	}
+
+	// Get buffered request body (may be nil for providers that don't need it).
+	var requestBody []byte
+	if ctx.RequestBody != nil && ctx.RequestBody.Present {
+		requestBody = ctx.RequestBody.Content
+	}
+
+	// Normalize provider-specific usage fields into our common Usage struct.
+	usage, err := calc.Normalize(responseBody, requestBody)
+	if err != nil {
+		slog.Warn("llm-cost: failed to normalize usage", "model", modelName, "error", err)
+		return setCostMetadataV2(ctx, 0.0, costStatusNotCalculated)
+	}
+
+	// Calculate base cost using the provider-agnostic generic calculator.
+	baseCost := genericCalculateCost(usage, pricing)
+
+	// Apply provider-specific adjustments (geo/speed multipliers, router flat cost, etc.).
+	finalCost := calc.Adjust(baseCost, usage, pricing)
+
+	slog.Debug("llm-cost: calculated cost",
+		"model", modelName,
+		"provider", pricing.Provider,
+		"prompt_tokens", usage.PromptTokens,
+		"completion_tokens", usage.CompletionTokens,
+		"cost_usd", finalCost,
+	)
+
+	return setCostMetadataV2(ctx, finalCost, costStatusCalculated)
+}
+
+// setCostMetadataV2 writes x-llm-cost and x-llm-cost-status into SharedContext.Metadata
+// for the v1alpha2 engine path.
+func setCostMetadataV2(ctx *policyv1alpha2.ResponseContext, costUSD float64, status string) policyv1alpha2.ResponseAction {
+	if ctx.SharedContext == nil {
+		slog.Warn("llm-cost: SharedContext is nil, cannot set cost metadata")
+		return policyv1alpha2.DownstreamResponseModifications{}
+	}
+	if ctx.Metadata == nil {
+		ctx.Metadata = make(map[string]interface{})
+	}
+	ctx.Metadata[MetadataLLMCost] = fmt.Sprintf("%.10f", costUSD)
+	ctx.Metadata[MetadataLLMCostStatus] = status
+	return policyv1alpha2.DownstreamResponseModifications{}
 }

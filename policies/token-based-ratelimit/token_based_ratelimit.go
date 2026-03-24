@@ -552,12 +552,6 @@ func (p *TokenBasedRateLimitPolicy) OnRequestBody(
 	ctx *policyv1alpha2.RequestContext,
 	params map[string]interface{},
 ) policyv1alpha2.RequestAction {
-	return p.processRequestBody(ctx)
-}
-
-func (p *TokenBasedRateLimitPolicy) processRequestBody(
-	ctx *policyv1alpha2.RequestContext,
-) policyv1alpha2.RequestAction {
 	slog.Debug("OnRequestBody: processing token-based rate limit",
 		"route", p.metadata.RouteName)
 

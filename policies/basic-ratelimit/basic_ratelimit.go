@@ -19,6 +19,7 @@
 package basicratelimit
 
 import (
+	policyv1alpha2 "github.com/wso2/api-platform/sdk/core/policy/v1alpha2"
 	policy "github.com/wso2/api-platform/sdk/gateway/policy/v1alpha"
 	ratelimit "github.com/wso2/gateway-controllers/policies/advanced-ratelimit"
 )
@@ -140,4 +141,60 @@ func (p *BasicRateLimitPolicy) OnResponse(
 	params map[string]interface{},
 ) policy.ResponseAction {
 	return p.delegate.OnResponse(ctx, params)
+}
+
+// OnRequestHeaders delegates to the core ratelimit policy's OnRequestHeaders method if available.
+func (p *BasicRateLimitPolicy) OnRequestHeaders(
+	ctx *policyv1alpha2.RequestHeaderContext,
+	params map[string]interface{},
+) policyv1alpha2.RequestHeaderAction {
+	type requestHeaderPolicer interface {
+		OnRequestHeaders(*policyv1alpha2.RequestHeaderContext, map[string]interface{}) policyv1alpha2.RequestHeaderAction
+	}
+	if rl, ok := p.delegate.(requestHeaderPolicer); ok {
+		return rl.OnRequestHeaders(ctx, params)
+	}
+	return policyv1alpha2.UpstreamRequestHeaderModifications{}
+}
+
+// OnRequestBody delegates to the core ratelimit policy's OnRequestBody method if available.
+func (p *BasicRateLimitPolicy) OnRequestBody(
+	ctx *policyv1alpha2.RequestContext,
+	params map[string]interface{},
+) policyv1alpha2.RequestAction {
+	type requestBodyPolicer interface {
+		OnRequestBody(*policyv1alpha2.RequestContext, map[string]interface{}) policyv1alpha2.RequestAction
+	}
+	if rl, ok := p.delegate.(requestBodyPolicer); ok {
+		return rl.OnRequestBody(ctx, params)
+	}
+	return policyv1alpha2.UpstreamRequestModifications{}
+}
+
+// OnResponseHeaders delegates to the core ratelimit policy's OnResponseHeaders method if available.
+func (p *BasicRateLimitPolicy) OnResponseHeaders(
+	ctx *policyv1alpha2.ResponseHeaderContext,
+	params map[string]interface{},
+) policyv1alpha2.ResponseHeaderAction {
+	type responseHeaderPolicer interface {
+		OnResponseHeaders(*policyv1alpha2.ResponseHeaderContext, map[string]interface{}) policyv1alpha2.ResponseHeaderAction
+	}
+	if rl, ok := p.delegate.(responseHeaderPolicer); ok {
+		return rl.OnResponseHeaders(ctx, params)
+	}
+	return policyv1alpha2.DownstreamResponseHeaderModifications{}
+}
+
+// OnResponseBody delegates to the core ratelimit policy's OnResponseBody method if available.
+func (p *BasicRateLimitPolicy) OnResponseBody(
+	ctx *policyv1alpha2.ResponseContext,
+	params map[string]interface{},
+) policyv1alpha2.ResponseAction {
+	type responseBodyPolicer interface {
+		OnResponseBody(*policyv1alpha2.ResponseContext, map[string]interface{}) policyv1alpha2.ResponseAction
+	}
+	if rl, ok := p.delegate.(responseBodyPolicer); ok {
+		return rl.OnResponseBody(ctx, params)
+	}
+	return policyv1alpha2.DownstreamResponseModifications{}
 }
