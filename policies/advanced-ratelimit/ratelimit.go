@@ -30,6 +30,7 @@ import (
 	"time"
 
 	"github.com/redis/go-redis/v9"
+	policyv1alpha2 "github.com/wso2/api-platform/sdk/core/policy/v1alpha2"
 	policy "github.com/wso2/api-platform/sdk/gateway/policy/v1alpha"
 	_ "github.com/wso2/gateway-controllers/policies/advanced-ratelimit/algorithms/fixedwindow" // Register Fixed Window algorithm
 	_ "github.com/wso2/gateway-controllers/policies/advanced-ratelimit/algorithms/gcra"        // Register GCRA algorithm
@@ -409,8 +410,9 @@ func GetPolicy(
 
 // Metadata keys for storing data across request/response phases
 const (
-	rateLimitResultKey = "ratelimit:result"
-	rateLimitKeysKey   = "ratelimit:keys" // Store extracted keys for post-response cost extraction
+	rateLimitResultKey        = "ratelimit:result"
+	rateLimitKeysKey          = "ratelimit:keys"           // Store extracted keys for post-response cost extraction
+	rateLimitHeaderHandledKey = "ratelimit:header_handled" // Quota names fully handled in header phase
 )
 
 // Mode returns the processing mode for this policy
@@ -1531,4 +1533,208 @@ func getQuotaCacheKey(base, apiName string, q *QuotaRuntime, index int) string {
 	h.Write([]byte("|"))
 
 	return hex.EncodeToString(h.Sum(nil))
+}
+
+// OnRequestHeaders performs the rate limit check in the header phase for quotas that do not
+// require request body or CEL-based key extraction. Quotas needing the body (cost extraction
+// from request_body / request_cel) or CEL key extraction are deferred to OnRequest.
+func (p *RateLimitPolicy) OnRequestHeaders(ctx *policyv1alpha2.RequestHeaderContext, params map[string]interface{}) policyv1alpha2.RequestHeaderAction {
+	slog.Debug("Rate limit header phase check started",
+		"route", p.routeName,
+		"quotaCount", len(p.quotas))
+
+	var quotaResults []quotaResult
+	quotaKeys := make(map[string]string)
+	handledQuotas := make(map[string]bool)
+
+	for i := range p.quotas {
+		q := &p.quotas[i]
+		quotaName := q.Name
+		if quotaName == "" {
+			quotaName = fmt.Sprintf("quota-%d", i)
+		}
+
+		// Defer quotas with CEL key extraction — requires full RequestContext
+		hasCELKey := false
+		for _, comp := range q.KeyExtraction {
+			if comp.Type == "cel" {
+				hasCELKey = true
+				break
+			}
+		}
+		if hasCELKey {
+			slog.Debug("Deferring quota to body phase: CEL key extraction", "quota", quotaName)
+			continue
+		}
+
+		key := p.extractQuotaKeyFromHeaderCtx(ctx, q)
+		quotaKeys[quotaName] = key
+
+		if q.CostExtractionEnabled && q.CostExtractor != nil {
+			// Cost extraction configured — only pre-check quota availability; actual
+			// consumption remains in OnRequest (request-phase sources) or OnResponse
+			// (response-phase sources).
+			available, err := q.Limiter.GetAvailable(context.Background(), key)
+			if err != nil {
+				if p.backend == "redis" && p.redisFailOpen {
+					slog.Warn("Rate limit pre-check failed (fail-open)", "error", err, "quota", quotaName)
+					continue
+				}
+				slog.Error("Rate limit pre-check failed (fail-closed)", "error", err, "quota", quotaName)
+				v1r := p.buildRateLimitResponse(nil, quotaName, quotaResults)
+				return policyv1alpha2.ImmediateResponse{StatusCode: v1r.StatusCode, Headers: v1r.Headers, Body: v1r.Body}
+			}
+			if available <= 0 {
+				slog.Debug("Cost extraction mode: quota exhausted in header phase",
+					"quota", quotaName, "key", key)
+				duration := getDurationFromQuota(q)
+				result := &limiter.Result{
+					Allowed:   false,
+					Limit:     getLimitFromQuota(q),
+					Remaining: 0,
+					Reset:     time.Now().Add(duration),
+					Duration:  duration,
+				}
+				v1r := p.buildRateLimitResponse(result, quotaName, quotaResults)
+				return policyv1alpha2.ImmediateResponse{StatusCode: v1r.StatusCode, Headers: v1r.Headers, Body: v1r.Body}
+			}
+			// Not exhausted — defer full consumption to OnRequest/OnResponse
+		} else {
+			// Standard mode (no cost extraction): consume 1 token in header phase
+			result, err := q.Limiter.AllowN(context.Background(), key, 1)
+			if err != nil {
+				if p.backend == "redis" && p.redisFailOpen {
+					slog.Warn("Rate limit check failed (fail-open)", "error", err, "quota", quotaName)
+					continue
+				}
+				slog.Error("Rate limit check failed (fail-closed)", "error", err, "quota", quotaName)
+				v1r := p.buildRateLimitResponse(nil, quotaName, quotaResults)
+				return policyv1alpha2.ImmediateResponse{StatusCode: v1r.StatusCode, Headers: v1r.Headers, Body: v1r.Body}
+			}
+			if !result.Allowed {
+				slog.Debug("Rate limit exceeded in header phase", "quota", quotaName, "key", key)
+				v1r := p.buildRateLimitResponse(result, quotaName, quotaResults)
+				return policyv1alpha2.ImmediateResponse{StatusCode: v1r.StatusCode, Headers: v1r.Headers, Body: v1r.Body}
+			}
+			quotaResults = append(quotaResults, quotaResult{
+				QuotaName: quotaName,
+				Result:    result,
+				Key:       key,
+				Duration:  result.Duration,
+			})
+			handledQuotas[quotaName] = true
+		}
+	}
+
+	ctx.Metadata[rateLimitResultKey] = quotaResults
+	ctx.Metadata[rateLimitKeysKey] = quotaKeys
+	ctx.Metadata[rateLimitHeaderHandledKey] = handledQuotas
+
+	return policyv1alpha2.UpstreamRequestHeaderModifications{}
+}
+
+// extractQuotaKeyFromHeaderCtx builds the rate limit key from header-phase context.
+// Supports all key types except "cel" (which requires full RequestContext).
+func (p *RateLimitPolicy) extractQuotaKeyFromHeaderCtx(ctx *policyv1alpha2.RequestHeaderContext, q *QuotaRuntime) string {
+	if len(q.KeyExtraction) == 0 {
+		return p.routeName
+	}
+	if len(q.KeyExtraction) == 1 {
+		return p.extractKeyComponentFromHeaderCtx(ctx, q.KeyExtraction[0])
+	}
+	parts := make([]string, 0, len(q.KeyExtraction))
+	for _, comp := range q.KeyExtraction {
+		parts = append(parts, p.extractKeyComponentFromHeaderCtx(ctx, comp))
+	}
+	return strings.Join(parts, ":")
+}
+
+// extractKeyComponentFromHeaderCtx extracts a single key component from header-phase context.
+func (p *RateLimitPolicy) extractKeyComponentFromHeaderCtx(ctx *policyv1alpha2.RequestHeaderContext, comp KeyComponent) string {
+	switch comp.Type {
+	case "header":
+		values := ctx.Headers.Get(strings.ToLower(comp.Key))
+		if len(values) > 0 && values[0] != "" {
+			return values[0]
+		}
+		placeholder := fmt.Sprintf("_missing_header_%s_", comp.Key)
+		slog.Warn("Header not found for rate limit key, using placeholder", "header", comp.Key, "placeholder", placeholder)
+		return placeholder
+
+	case "constant":
+		return comp.Key
+
+	case "metadata":
+		if val, ok := ctx.Metadata[comp.Key]; ok {
+			if strVal, ok := val.(string); ok && strVal != "" {
+				return strVal
+			}
+		}
+		placeholder := fmt.Sprintf("_missing_metadata_%s_", comp.Key)
+		slog.Warn("Metadata key not found for rate limit key, using placeholder", "key", comp.Key, "placeholder", placeholder)
+		return placeholder
+
+	case "ip":
+		if xff := ctx.Headers.Get("x-forwarded-for"); len(xff) > 0 && xff[0] != "" {
+			ips := strings.Split(xff[0], ",")
+			if len(ips) > 0 {
+				if ip := strings.TrimSpace(ips[0]); ip != "" {
+					return ip
+				}
+			}
+		}
+		if xri := ctx.Headers.Get("x-real-ip"); len(xri) > 0 && xri[0] != "" {
+			return xri[0]
+		}
+		slog.Warn("Could not extract IP address for rate limit key, using 'unknown'")
+		return "unknown"
+
+	case "routename":
+		return p.routeName
+
+	default:
+		// "apiname", "apiversion", "cel" and unknown types are not available in header phase;
+		// callers should have filtered these out before reaching here.
+		slog.Warn("Key extraction type not supported in header phase, using routeName fallback", "type", comp.Type)
+		return p.routeName
+	}
+}
+
+// OnRequestBody performs rate limit check across all quotas.
+func (p *RateLimitPolicy) OnRequestBody(
+	ctx *policyv1alpha2.RequestContext,
+	_ map[string]interface{},
+) policyv1alpha2.RequestAction {
+	// TODO
+	return nil
+}
+
+// OnResponseHeaders adds rate limit headers in the response header phase using results
+// already available from the request phase. Response-phase cost extraction quotas will
+// have their final values updated by OnResponse once the body is processed.
+func (p *RateLimitPolicy) OnResponseHeaders(ctx *policyv1alpha2.ResponseHeaderContext, params map[string]interface{}) policyv1alpha2.ResponseHeaderAction {
+	resultsRaw, ok := ctx.Metadata[rateLimitResultKey]
+	if !ok {
+		return policyv1alpha2.DownstreamResponseHeaderModifications{}
+	}
+	storedResults, ok := resultsRaw.([]quotaResult)
+	if !ok || len(storedResults) == 0 {
+		return policyv1alpha2.DownstreamResponseHeaderModifications{}
+	}
+	headers := p.buildMultiQuotaHeaders(storedResults, false, "")
+	if len(headers) == 0 {
+		return policyv1alpha2.DownstreamResponseHeaderModifications{}
+	}
+	return policyv1alpha2.DownstreamResponseHeaderModifications{
+		HeadersToSet: headers,
+	}
+}
+
+// OnResponseBody processes response-phase cost extraction and emits rate limit headers.
+func (p *RateLimitPolicy) OnResponseBody(
+	ctx *policyv1alpha2.ResponseContext,
+	_ map[string]interface{},
+) policyv1alpha2.ResponseAction {
+	// TODO
+	return nil
 }
