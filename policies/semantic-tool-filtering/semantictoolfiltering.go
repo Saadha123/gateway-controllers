@@ -215,19 +215,19 @@ func GetPolicy(
 
 	// Parse and validate embedding provider configuration (from systemParameters)
 	if err := parseEmbeddingConfig(params, p); err != nil {
-		return nil, fmt.Errorf("invalid embedding config: %w")
+		return nil, fmt.Errorf("invalid embedding config")
 	}
 
 	// Initialize embedding provider
 	embeddingProvider, err := createEmbeddingProvider(p.embeddingConfig)
 	if err != nil {
-		return nil, fmt.Errorf("failed to create embedding provider: %w")
+		return nil, fmt.Errorf("failed to create embedding provider")
 	}
 	p.embeddingProvider = embeddingProvider
 
 	// Parse policy parameters (runtime parameters)
 	if err := parseParams(params, p); err != nil {
-		return nil, fmt.Errorf("invalid params: %w")
+		return nil, fmt.Errorf("invalid params")
 	}
 
 	slog.Debug("SemanticToolFiltering: Policy initialized",
@@ -498,7 +498,7 @@ func createEmbeddingProvider(config embeddingproviders.EmbeddingProviderConfig) 
 	}
 
 	if err := provider.Init(config); err != nil {
-		return nil, fmt.Errorf("failed to initialize embedding provider: %w")
+		return nil, fmt.Errorf("failed to initialize embedding provider")
 	}
 
 	return provider, nil
