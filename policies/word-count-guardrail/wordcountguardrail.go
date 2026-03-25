@@ -274,7 +274,7 @@ func (p *WordCountGuardrailPolicy) Mode() policy.ProcessingMode {
 		RequestHeaderMode:  policy.HeaderModeSkip,
 		RequestBodyMode:    policy.BodyModeBuffer,
 		ResponseHeaderMode: policy.HeaderModeSkip,
-		ResponseBodyMode:   policy.BodyModeBuffer,
+		ResponseBodyMode:   policy.BodyModeStream,
 	}
 }
 

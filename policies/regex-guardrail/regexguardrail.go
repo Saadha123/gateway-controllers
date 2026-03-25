@@ -201,7 +201,7 @@ func (p *RegexGuardrailPolicy) Mode() policy.ProcessingMode {
 		RequestHeaderMode:  policy.HeaderModeSkip,
 		RequestBodyMode:    policy.BodyModeBuffer, // Need full body for validation
 		ResponseHeaderMode: policy.HeaderModeSkip,
-		ResponseBodyMode:   policy.BodyModeBuffer, // Need full body for validation
+		ResponseBodyMode:   policy.BodyModeStream, // Need full sentence for validation
 	}
 }
 

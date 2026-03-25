@@ -231,7 +231,7 @@ func (p *PIIMaskingRegexPolicy) Mode() policy.ProcessingMode {
 		RequestHeaderMode:  policy.HeaderModeSkip,
 		RequestBodyMode:    policy.BodyModeBuffer,
 		ResponseHeaderMode: policy.HeaderModeSkip,
-		ResponseBodyMode:   policy.BodyModeBuffer,
+		ResponseBodyMode:   policy.BodyModeStream,
 	}
 }
 
@@ -929,6 +929,7 @@ func hasTrailingPartialDataLine(s string) bool {
 //   - the concatenated content string
 //   - the 0-based data-line index of the last line that contributed a '[' character
 //   - the total number of complete SSE data lines processed
+//
 // TODO (Set Jsonstreaming path)
 func extractSSEDeltaContentTracked(s string) (string, int, int) {
 	var sb strings.Builder

@@ -72,7 +72,7 @@ func (p *LogMessagePolicy) Mode() policy.ProcessingMode {
 		RequestHeaderMode:  policy.HeaderModeProcess, // Process request headers for logging
 		RequestBodyMode:    policy.BodyModeBuffer,    // Need request body for logging
 		ResponseHeaderMode: policy.HeaderModeProcess, // Process response headers for logging
-		ResponseBodyMode:   policy.BodyModeBuffer,    // Need response body for logging
+		ResponseBodyMode:   policy.BodyModeStream,    // Need response body for logging
 	}
 }
 
@@ -379,7 +379,6 @@ func (p *LogMessagePolicy) OnResponseBody(ctx *policyv1alpha2.ResponseContext, p
 	// Continue with the response unchanged.
 	return policyv1alpha2.DownstreamResponseModifications{}
 }
-
 
 // ─── Streaming (SSE) support ──────────────────────────────────────────────────
 //
