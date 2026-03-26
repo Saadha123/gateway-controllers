@@ -447,6 +447,14 @@ func (p *RateLimitPolicy) Mode() policy.ProcessingMode {
 				responseBodyMode = policy.BodyModeBuffer
 			}
 		}
+		// CEL key extraction requires the full RequestContext (not available in the header phase),
+		// so OnRequestBody must be called even for requests without a body.
+		for _, comp := range q.KeyExtraction {
+			if comp.Type == "cel" {
+				requestBodyMode = policy.BodyModeBuffer
+				break
+			}
+		}
 	}
 
 	return policy.ProcessingMode{
@@ -1553,28 +1561,29 @@ func getBaseCacheKey(routeName, apiName, algorithm string, params map[string]int
 	return hex.EncodeToString(h.Sum(nil))
 }
 
-// getQuotaCacheKey produces final key per quota using base + quota-specific config.
-// apiName is passed separately to enable API-scoped cache keys for quotas using apiname keyExtraction.
+// getQuotaCacheKey produces the limiter cache key for a quota.
+// Quotas whose key extraction does not include "routename" are API-scoped: all routes of the
+// same API share one limiter instance so cross-route counters are correctly aggregated.
+// Quotas that include "routename" are route-scoped and each route gets its own limiter.
 func getQuotaCacheKey(base, apiName string, q *QuotaRuntime, index int) string {
 	h := sha256.New()
 
-	// Determine scope from keyExtraction
-	hasApiName := false
+	// Determine scope from keyExtraction.
+	// A quota is route-scoped only when it explicitly includes "routename" in its key extraction,
+	// meaning the counter key itself depends on which route is being processed.
+	// All other key types (constant, apiname, header, ip, metadata, cel, etc.) produce keys
+	// that are independent of the route, so their limiters should be shared across all routes
+	// of the same API to give correct cross-route counting.
 	hasRouteName := false
 	for _, comp := range q.KeyExtraction {
-		if comp.Type == "apiname" {
-			hasApiName = true
-		}
 		if comp.Type == "routename" {
 			hasRouteName = true
+			break
 		}
 	}
 
-	// For API-scoped quotas (apiname key extraction without routename),
-	// use a stable API-based cache key so all routes under the same API share the limiter.
-	// Otherwise, use the route-specific base cache key.
-	if hasApiName && !hasRouteName {
-		// API-scoped: use apiName instead of route-specific base
+	if !hasRouteName {
+		// API-scoped: share the limiter across all routes of this API
 		h.Write([]byte("apiScope:"))
 		h.Write([]byte(apiName))
 		h.Write([]byte("|"))
@@ -1765,8 +1774,22 @@ func (p *RateLimitPolicy) extractKeyComponentFromHeaderCtx(ctx *policyv1alpha2.R
 	case "routename":
 		return p.routeName
 
+	case "apiname":
+		if ctx.APIName != "" {
+			return ctx.APIName
+		}
+		slog.Warn("APIName not available in header phase for rate limit key, using empty string")
+		return ""
+
+	case "apiversion":
+		if ctx.APIVersion != "" {
+			return ctx.APIVersion
+		}
+		slog.Warn("APIVersion not available in header phase for rate limit key, using empty string")
+		return ""
+
 	default:
-		// "apiname", "apiversion", "cel" and unknown types are not available in header phase;
+		// "cel" and unknown types are not available in header phase;
 		// callers should have filtered these out before reaching here.
 		slog.Warn("Key extraction type not supported in header phase, using routeName fallback", "type", comp.Type)
 		return p.routeName

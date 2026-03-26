@@ -322,11 +322,30 @@ func (e *CostExtractor) extractFromResponseSourceV2(ctx *policyv1alpha2.Response
 		return e.extractFromResponseMetadataV2(ctx, source.Key)
 	case CostSourceResponseBody:
 		return e.extractFromResponseBodyV2(ctx, source.JSONPath)
+	case CostSourceResponseCEL:
+		return e.extractFromResponseCELV2(ctx, source.Expression)
 	default:
-		// response_cel not yet implemented for v1alpha2
 		slog.Debug("Unsupported response cost source type for v1alpha2", "type", source.Type)
 		return 0, false
 	}
+}
+
+func (e *CostExtractor) extractFromResponseCELV2(ctx *policyv1alpha2.ResponseContext, expression string) (float64, bool) {
+	evaluator, err := GetCELEvaluator()
+	if err != nil {
+		slog.Error("Failed to get CEL evaluator for response cost extraction (v2)", "error", err)
+		return 0, false
+	}
+
+	cost, err := evaluator.EvaluateResponseCostExpressionV2(expression, ctx)
+	if err != nil {
+		slog.Debug("CEL response cost extraction failed (v2)",
+			"expression", expression,
+			"error", err)
+		return 0, false
+	}
+
+	return cost, true
 }
 
 func (e *CostExtractor) extractFromResponseHeaderV2(ctx *policyv1alpha2.ResponseContext, headerName string) (float64, bool) {
@@ -751,14 +770,15 @@ func (e *CostExtractor) RequiresResponseBody() bool {
 	return false
 }
 
-// RequiresRequestBody returns true if any source requires request body access
+// RequiresRequestBody returns true if any source requires the OnRequestBody phase.
+// request_header and request_metadata are available in the header phase but their
+// cost consumption is deferred to OnRequestBody, so those also require buffering.
 func (e *CostExtractor) RequiresRequestBody() bool {
 	if !e.config.Enabled {
 		return false
 	}
 	for _, source := range e.config.Sources {
-		// request_body always needs body, request_cel may need it for body-related expressions
-		if source.Type == CostSourceRequestBody || source.Type == CostSourceRequestCEL {
+		if isRequestPhaseSource(source.Type) {
 			return true
 		}
 	}
