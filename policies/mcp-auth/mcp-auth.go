@@ -113,7 +113,13 @@ func GetPolicyV2(
 	metadata policyv1alpha2.PolicyMetadata,
 	params map[string]interface{},
 ) (policyv1alpha2.Policy, error) {
-	return ins, nil
+	return GetPolicy(policy.PolicyMetadata{
+		RouteName:  metadata.RouteName,
+		APIId:      metadata.APIId,
+		APIName:    metadata.APIName,
+		APIVersion: metadata.APIVersion,
+		AttachedTo: policy.Level(metadata.AttachedTo),
+	}, params)
 }
 
 func (p *McpAuthPolicy) Mode() policy.ProcessingMode {
@@ -604,23 +610,25 @@ func ensureRequestMetadata(ctx *policy.RequestContext) {
 	}
 }
 
-// OnRequestHeaders processes the request header phase for MCP authentication.
-func (p *McpAuthPolicy) OnRequestHeaders(ctx *policyv1alpha2.RequestHeaderContext, params map[string]any) policyv1alpha2.RequestHeaderAction {
-	userIssuers := getStringArrayParam(params, "issuers", []string{})
-	onFailureStatusCode := getIntParam(params, "onFailureStatusCode", 401)
-	errorMessageFormat := getStringParam(params, "errorMessageFormat", "json")
-	userRequiredScopes := getStringArrayParam(params, "requiredScopes", []string{})
-	if err := validateAuthFailureConfig(onFailureStatusCode, errorMessageFormat); err != nil {
+func ensureRequestMetadataV2(ctx *policyv1alpha2.RequestContext) {
+	if ctx.SharedContext == nil {
+		ctx.SharedContext = &policyv1alpha2.SharedContext{}
+	}
+	if ctx.Metadata == nil {
+		ctx.Metadata = map[string]any{}
+	}
+}
+
+// OnRequestBody processes the request body phase for MCP authentication.
+func (p *McpAuthPolicy) OnRequestBody(ctx *policyv1alpha2.RequestContext, params map[string]any) policyv1alpha2.RequestAction {
+	if err := validateAuthFailureConfig(p.OnFailureStatusCode, p.ErrorMessageFormat); err != nil {
 		v1r := buildInvalidConfigResponseV2(err.Error()).(policyv1alpha2.ImmediateResponse)
 		return policyv1alpha2.ImmediateResponse{StatusCode: v1r.StatusCode, Headers: v1r.Headers, Body: v1r.Body}
 	}
 
-	gatewayHost := getStringParam(params, "gatewayHost", "")
-	if gatewayHost != "" {
-		if ctx.Metadata == nil {
-			ctx.Metadata = map[string]any{}
-		}
-		ctx.Metadata["gatewayHost"] = gatewayHost
+	if p.GatewayHost != "" {
+		ensureRequestMetadataV2(ctx)
+		ctx.Metadata["gatewayHost"] = p.GatewayHost
 	}
 
 	// Check for GET /.well-known/oauth-protected-resource
@@ -633,7 +641,7 @@ func (p *McpAuthPolicy) OnRequestHeaders(ctx *policyv1alpha2.RequestHeaderContex
 
 		keyManagersRaw, ok := params["keyManagers"]
 		if !ok {
-			return p.handleAuthFailureHeaders(ctx.SharedContext, onFailureStatusCode, errorMessageFormat, "key managers not configured")
+			return p.handleAuthFailureV2(ctx.SharedContext, p.OnFailureStatusCode, p.ErrorMessageFormat, "key managers not configured")
 		}
 
 		issuers, kms, err := parseKeyManagers(keyManagersRaw)
@@ -642,12 +650,12 @@ func (p *McpAuthPolicy) OnRequestHeaders(ctx *policyv1alpha2.RequestHeaderContex
 			return policyv1alpha2.ImmediateResponse{StatusCode: v1r.StatusCode, Headers: v1r.Headers, Body: v1r.Body}
 		}
 		if len(issuers) == 0 {
-			return p.handleAuthFailureHeaders(ctx.SharedContext, onFailureStatusCode, errorMessageFormat, "no valid key managers found")
+			return p.handleAuthFailureV2(ctx.SharedContext, p.OnFailureStatusCode, p.ErrorMessageFormat, "no valid key managers found")
 		}
 
-		if len(userIssuers) > 0 {
+		if len(p.Issuers) > 0 {
 			filteredIssuers := []string{}
-			for _, ui := range userIssuers {
+			for _, ui := range p.Issuers {
 				if issuer, ok := kms[ui]; ok {
 					filteredIssuers = append(filteredIssuers, issuer)
 				}
@@ -656,13 +664,13 @@ func (p *McpAuthPolicy) OnRequestHeaders(ctx *policyv1alpha2.RequestHeaderContex
 		}
 
 		if len(issuers) == 0 {
-			return p.handleAuthFailureHeaders(ctx.SharedContext, onFailureStatusCode, errorMessageFormat, "no matching issuers found")
+			return p.handleAuthFailureV2(ctx.SharedContext, p.OnFailureStatusCode, p.ErrorMessageFormat, "no matching issuers found")
 		}
 
 		prm := ProtectedResourceMetadata{
 			Resource:             generateResourcePathFromFields(ctx.Scheme, ctx.Authority, ctx.Vhost, ctx.APIContext, params, "mcp"),
 			AuthorizationServers: issuers,
-			ScopesSupported:      userRequiredScopes,
+			ScopesSupported:      p.RequiredScopes,
 		}
 		jsonOut, _ := json.Marshal(prm)
 		return policyv1alpha2.ImmediateResponse{
@@ -673,66 +681,35 @@ func (p *McpAuthPolicy) OnRequestHeaders(ctx *policyv1alpha2.RequestHeaderContex
 			},
 			Body: jsonOut,
 		}
+	} else if ctx.Method == "POST" && strings.Contains(ctx.OperationPath, "mcp") {
+		if ctx.Body == nil || !ctx.Body.Present {
+			return p.handleAuthV2(ctx, params, p.RequiredScopes)
+		}
+		var mcpReq MCPRequest
+		if err := json.Unmarshal(ctx.Body.Content, &mcpReq); err != nil {
+			slog.Debug("MCP Auth Policy: Body:", "content", string(ctx.Body.Content))
+			slog.Debug("MCP Auth Policy: Failed to parse MCP request", "error", err)
+			return p.handleAuthFailureV2(ctx.SharedContext, p.OnFailureStatusCode, p.ErrorMessageFormat, "Invalid MCP request format")
+		}
+
+		slog.Debug("MCP Auth Policy: Extracted MCP attributes",
+			"method", mcpReq.Method,
+			"name", mcpReq.Params.Name,
+			"uri", mcpReq.Params.URI)
+
+		if !p.isAuthRequired(mcpReq) {
+			slog.Debug("MCP Auth Policy: Skipping authentication for exempt request", "method", mcpReq.Method)
+			return nil
+		}
+
+		return p.handleAuthV2(ctx, params, p.RequiredScopes)
 	}
-	return p.handleAuthHeaders(ctx, params, userRequiredScopes)
+
+	return nil
 }
 
-// handleAuthHeaders performs MCP authentication in the request header phase.
-func (p *McpAuthPolicy) handleAuthHeaders(ctx *policyv1alpha2.RequestHeaderContext, params map[string]any, scopes []string) policyv1alpha2.RequestHeaderAction {
-	type requestHeaderPolicer interface {
-		OnRequestHeaders(*policyv1alpha2.RequestHeaderContext, map[string]interface{}) policyv1alpha2.RequestHeaderAction
-	}
-
-	sessionIds := ctx.Headers.Get(McpSessionHeader)
-	sessionId := ""
-	if len(sessionIds) > 0 {
-		sessionId = sessionIds[0]
-	}
-
-	// jwtPolicy, err := jwtauth.GetPolicyV2(policyv1alpha2.PolicyMetadata{}, params)
-	jwtPolicy, err := jwtauth.GetPolicy(policy.PolicyMetadata{}, params)
-	if err != nil {
-		return p.handleAuthFailureHeaders(ctx.SharedContext, 500, "json", fmt.Sprintf("jwtauth.GetPolicy unavailable: %s", err))
-	}
-	hrp, ok := jwtPolicy.(requestHeaderPolicer)
-	if !ok {
-		return p.handleAuthFailureHeaders(ctx.SharedContext, 500, "json", "jwtPolicy does not implement OnRequestHeaders (requestHeaderPolicer)")
-	}
-
-	headerAction := hrp.OnRequestHeaders(ctx, params)
-	if ir, ok := headerAction.(policyv1alpha2.ImmediateResponse); ok {
-		ctx.SharedContext.AuthContext = &policyv1alpha2.AuthContext{
-			Authenticated: false,
-			AuthType:      AuthType,
-			Previous:      ctx.SharedContext.AuthContext,
-		}
-		headers := ir.Headers
-		escapedDesc := ""
-		if headers["content-type"] == "application/json" {
-			var errResp map[string]any
-			if err := json.Unmarshal(ir.Body, &errResp); err == nil {
-				if errDesc, ok := errResp["message"].(string); ok {
-					escapedDesc = strings.ReplaceAll(errDesc, "\"", "'")
-				}
-			}
-		}
-		wwwAuthHeader := generateWwwAuthenticateHeaderFromFields(ctx.Scheme, ctx.Authority, ctx.Vhost, ctx.APIContext, params, scopes, escapedDesc)
-		headers[WWWAuthenticateHeader] = wwwAuthHeader
-		headers[McpSessionHeader] = sessionId
-		return policyv1alpha2.ImmediateResponse{
-			StatusCode: ir.StatusCode,
-			Headers:    headers,
-			Body:       ir.Body,
-		}
-	}
-	if ctx.SharedContext.AuthContext != nil {
-		ctx.SharedContext.AuthContext.AuthType = AuthType
-	}
-	return headerAction
-}
-
-// handleAuthFailureHeaders constructs an authentication failure response in the header phase.
-func (p *McpAuthPolicy) handleAuthFailureHeaders(shared *policyv1alpha2.SharedContext, statusCode int, format string, reason any) policyv1alpha2.RequestHeaderAction {
+// handleAuthFailureV2 constructs an authentication failure response.
+func (p *McpAuthPolicy) handleAuthFailureV2(shared *policyv1alpha2.SharedContext, statusCode int, format string, reason any) policyv1alpha2.ImmediateResponse {
 	shared.AuthContext = &policyv1alpha2.AuthContext{
 		Authenticated: false,
 		AuthType:      AuthType,
@@ -765,6 +742,76 @@ func (p *McpAuthPolicy) handleAuthFailureHeaders(shared *policyv1alpha2.SharedCo
 		Headers:    headers,
 		Body:       []byte(body),
 	}
+}
+
+// handleAuthV2 performs MCP authentication in the request body phase.
+func (p *McpAuthPolicy) handleAuthV2(ctx *policyv1alpha2.RequestContext, params map[string]any, scopes []string) policyv1alpha2.RequestAction {
+	type requestHeaderPolicer interface {
+		OnRequestHeaders(*policyv1alpha2.RequestHeaderContext, map[string]interface{}) policyv1alpha2.RequestHeaderAction
+	}
+
+	sessionIds := ctx.Headers.Get(McpSessionHeader)
+	sessionId := ""
+	if len(sessionIds) > 0 {
+		sessionId = sessionIds[0]
+	}
+
+	slog.Debug("MCP Auth Policy: Delegating authentication to JWT Auth Policy")
+	jwtPolicy, err := jwtauth.GetPolicy(policy.PolicyMetadata{}, params)
+	if err != nil {
+		return p.handleAuthFailureV2(ctx.SharedContext, 500, "json", fmt.Sprintf("jwtauth.GetPolicy unavailable: %s", err))
+	}
+	hrp, ok := jwtPolicy.(requestHeaderPolicer)
+	if !ok {
+		return p.handleAuthFailureV2(ctx.SharedContext, 500, "json", "jwtPolicy does not implement OnRequestHeaders")
+	}
+
+	headerCtx := &policyv1alpha2.RequestHeaderContext{
+		SharedContext: ctx.SharedContext,
+		Headers:       ctx.Headers,
+		Path:          ctx.Path,
+		Method:        ctx.Method,
+		Authority:     ctx.Authority,
+		Scheme:        ctx.Scheme,
+		Vhost:         ctx.Vhost,
+	}
+	headerAction := hrp.OnRequestHeaders(headerCtx, params)
+	if ir, ok := headerAction.(policyv1alpha2.ImmediateResponse); ok {
+		slog.Debug("MCP Auth Policy: Authentication failed in JWT Auth Policy, handling failure")
+		ctx.SharedContext.AuthContext = &policyv1alpha2.AuthContext{
+			Authenticated: false,
+			AuthType:      AuthType,
+			Previous:      ctx.SharedContext.AuthContext,
+		}
+		headers := ir.Headers
+		escapedDesc := ""
+		if headers["content-type"] == "application/json" {
+			var errResp map[string]any
+			if err := json.Unmarshal(ir.Body, &errResp); err == nil {
+				if errDesc, ok := errResp["message"].(string); ok {
+					escapedDesc = strings.ReplaceAll(errDesc, "\"", "'")
+				}
+			}
+		}
+		wwwAuthHeader := generateWwwAuthenticateHeaderFromFields(ctx.Scheme, ctx.Authority, ctx.Vhost, ctx.APIContext, params, scopes, escapedDesc)
+		headers[WWWAuthenticateHeader] = wwwAuthHeader
+		headers[McpSessionHeader] = sessionId
+		return policyv1alpha2.ImmediateResponse{
+			StatusCode: ir.StatusCode,
+			Headers:    headers,
+			Body:       ir.Body,
+		}
+	}
+	// Override AuthType to mcp/oauth: mcp-auth is the effective policy that ran
+	if ctx.SharedContext.AuthContext != nil {
+		ctx.SharedContext.AuthContext.AuthType = AuthType
+	}
+	if a, ok := headerAction.(policyv1alpha2.UpstreamRequestHeaderModifications); ok {
+		return policyv1alpha2.UpstreamRequestModifications{
+			UpstreamRequestHeaderModifications: a,
+		}
+	}
+	return nil
 }
 
 // generateResourcePathFromFields builds the resource URL from individual context fields
