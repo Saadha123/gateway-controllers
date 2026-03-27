@@ -188,11 +188,11 @@ func (p *APIKeyPolicy) OnRequest(ctx *policy.RequestContext, params map[string]i
 
 	// Authentication successful
 	slog.Debug("API Key Auth Policy: Authentication successful")
-	return p.handleAuthSuccess(ctx, resolvedKey)
+	return p.handleAuthSuccess(ctx, resolvedKey, keyName, location)
 }
 
 // handleAuthSuccess handles successful authentication
-func (p *APIKeyPolicy) handleAuthSuccess(ctx *policy.RequestContext, resolvedKey *store.APIKey) policy.RequestAction {
+func (p *APIKeyPolicy) handleAuthSuccess(ctx *policy.RequestContext, resolvedKey *store.APIKey, keyName, location string) policy.RequestAction {
 	slog.Debug("API Key Auth Policy: handleAuthSuccess called",
 		"apiId", ctx.APIId,
 		"apiName", ctx.APIName,
@@ -212,6 +212,15 @@ func (p *APIKeyPolicy) handleAuthSuccess(ctx *policy.RequestContext, resolvedKey
 		},
 	}
 
+	mods := policy.UpstreamRequestModifications{}
+
+	// Strip API key from upstream request
+	if location == "header" {
+		mods.RemoveHeaders = []string{http.CanonicalHeaderKey(keyName)}
+	} else if location == "query" {
+		mods.RemoveQueryParameters = []string{keyName}
+	}
+
 	analyticsMetadata := map[string]any{}
 	if strings.TrimSpace(resolvedKey.ApplicationID) != "" {
 		analyticsMetadata[applicationIDMetadataKey] = strings.TrimSpace(resolvedKey.ApplicationID)
@@ -219,14 +228,11 @@ func (p *APIKeyPolicy) handleAuthSuccess(ctx *policy.RequestContext, resolvedKey
 	if strings.TrimSpace(resolvedKey.ApplicationName) != "" {
 		analyticsMetadata[applicationNameMetadataKey] = strings.TrimSpace(resolvedKey.ApplicationName)
 	}
-
-	if len(analyticsMetadata) == 0 {
-		return policy.UpstreamRequestModifications{}
+	if len(analyticsMetadata) > 0 {
+		mods.AnalyticsMetadata = analyticsMetadata
 	}
 
-	return policy.UpstreamRequestModifications{
-		AnalyticsMetadata: analyticsMetadata,
-	}
+	return mods
 }
 
 // OnResponse is not used by this policy (authentication is request-only)
@@ -336,7 +342,17 @@ func (p *APIKeyPolicy) OnRequestHeaders(ctx *policyv1alpha2.RequestHeaderContext
 	if errResp := p.authenticate(ctx.SharedContext, ctx.Headers, ctx.Path, ctx.Method, params); errResp != nil {
 		return *errResp
 	}
-	return policyv1alpha2.UpstreamRequestHeaderModifications{}
+
+	keyName, _ := params["key"].(string)
+	location, _ := params["in"].(string)
+
+	mods := policyv1alpha2.UpstreamRequestHeaderModifications{}
+	if location == "header" {
+		mods.HeadersToRemove = []string{http.CanonicalHeaderKey(keyName)}
+	} else if location == "query" {
+		mods.QueryParametersToRemove = []string{keyName}
+	}
+	return mods
 }
 
 // authenticate is the shared core logic for OnRequestHeaders.
