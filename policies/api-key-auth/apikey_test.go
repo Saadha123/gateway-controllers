@@ -60,8 +60,12 @@ func TestAPIKeyPolicy_OnRequestHeaders_SuccessFromHeader(t *testing.T) {
 	if ctx.SharedContext.AuthContext.AuthType != "apikey" {
 		t.Fatalf("expected AuthType='apikey', got %q", ctx.SharedContext.AuthContext.AuthType)
 	}
-	if _, ok := action.(policyv1alpha2.UpstreamRequestHeaderModifications); !ok {
+	mods, ok := action.(policyv1alpha2.UpstreamRequestHeaderModifications)
+	if !ok {
 		t.Fatalf("expected UpstreamRequestHeaderModifications, got %T", action)
+	}
+	if len(mods.HeadersToRemove) != 1 || mods.HeadersToRemove[0] != http.CanonicalHeaderKey("x-api-key") {
+		t.Fatalf("expected HeadersToRemove=[%q], got %v", http.CanonicalHeaderKey("x-api-key"), mods.HeadersToRemove)
 	}
 }
 
@@ -80,8 +84,12 @@ func TestAPIKeyPolicy_OnRequestHeaders_SuccessFromQuery(t *testing.T) {
 	if ctx.SharedContext.AuthContext == nil || !ctx.SharedContext.AuthContext.Authenticated {
 		t.Fatalf("expected AuthContext.Authenticated=true")
 	}
-	if _, ok := action.(policyv1alpha2.UpstreamRequestHeaderModifications); !ok {
+	mods, ok := action.(policyv1alpha2.UpstreamRequestHeaderModifications)
+	if !ok {
 		t.Fatalf("expected UpstreamRequestHeaderModifications, got %T", action)
+	}
+	if len(mods.QueryParametersToRemove) != 1 || mods.QueryParametersToRemove[0] != "x_api_key" {
+		t.Fatalf("expected QueryParametersToRemove=[%q], got %v", "x_api_key", mods.QueryParametersToRemove)
 	}
 }
 
@@ -363,7 +371,7 @@ func TestAPIKeyPolicy_AuthContext_PreviousPreserved_OnSuccess(t *testing.T) {
 	}
 	ctx.SharedContext.AuthContext = prior
 
-	p.handleAuthSuccess(ctx, &apikeycommon.APIKey{})
+	p.handleAuthSuccess(ctx, &apikeycommon.APIKey{}, "x-api-key", "header")
 
 	if ctx.SharedContext.AuthContext == nil {
 		t.Fatal("Expected AuthContext to be set")
