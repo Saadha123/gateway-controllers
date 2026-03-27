@@ -69,12 +69,12 @@ parameters:
           default: "$.choices[0].message.content"
         streamingJsonPath:
           type: string
-          x-wso2-policy-advanced-param: true
+          x-wso2-policy-advanced-param: false
           description: |
             JSONPath expression to extract content from SSE streaming delta chunks.
             Used when the upstream returns a streaming (stream: true) response.
             Defaults to the standard OpenAI SSE delta content path.
-          default: "$.choices[*].delta.content"
+          default: "$.choices[0].delta.content"
         onlyDNS:
           type: boolean
           x-wso2-policy-advanced-param: true

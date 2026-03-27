@@ -43,7 +43,7 @@ const (
 	sseDone                  = "[DONE]"
 	metaKeyAccContent        = "sentencecountguardrail:accumulated_content"
 	metaKeyAccJsonBody       = "sentencecountguardrail:json_body"
-	DefaultStreamingJsonPath = "$.choices[*].delta.content"
+	DefaultStreamingJsonPath = "$.choices[0].delta.content"
 )
 
 var (
@@ -273,7 +273,7 @@ func extractInt(value interface{}) (int, error) {
 // Mode returns the processing mode for this policy
 func (p *SentenceCountGuardrailPolicy) Mode() policy.ProcessingMode {
 	return policy.ProcessingMode{
-		RequestHeaderMode:  policy.HeaderModeSkip,
+		RequestHeaderMode:  policy.HeaderModeProcess, // needed to catch empty-body requests
 		RequestBodyMode:    policy.BodyModeBuffer,
 		ResponseHeaderMode: policy.HeaderModeSkip,
 		ResponseBodyMode:   policy.BodyModeStream,
@@ -528,7 +528,12 @@ func (p *SentenceCountGuardrailPolicy) OnResponseBody(ctx *policyv1alpha2.Respon
 		content = ctx.ResponseBody.Content
 	}
 
-	if text := extractSSEDeltaContent(string(content), p.responseParams.StreamingJsonPath); text != "" {
+	contentStr := string(content)
+	if isSSEChunk(contentStr) {
+		// SSE body: always use the SSE extraction path, even when all delta content fields are
+		// null (e.g. tool-call responses), so we never fall through to JSONPath extraction on
+		// SSE-formatted data.
+		text := extractSSEDeltaContent(contentStr, p.responseParams.StreamingJsonPath)
 		return p.validateSentenceCountInText(text, p.responseParams, true)
 	}
 
@@ -712,6 +717,25 @@ func (p *SentenceCountGuardrailPolicy) OnResponseBodyChunk(ctx *policyv1alpha2.R
 		full := prev + chunkStr
 		ctx.Metadata[metaKeyAccJsonBody] = full
 		if !chunk.EndOfStream {
+			return policyv1alpha2.ResponseChunkAction{}
+		}
+		// An empty or whitespace-only EndOfStream chunk is a bare sentinel that arrives after
+		// the SSE [DONE] event (common in many streaming frameworks). In this case all content
+		// was already processed by the SSE path, so we must not attempt JSONPath extraction on
+		// an empty body. Instead, run the final SSE min/invert check on accumulated SSE content.
+		if strings.TrimSpace(full) == "" {
+			rp := p.responseParams
+			accContent, _ := ctx.Metadata[metaKeyAccContent].(string)
+			count := countSentences(accContent)
+			if !rp.Invert {
+				if count < rp.Min {
+					reason := fmt.Sprintf("sentence count %d is below minimum of %d sentences", count, rp.Min)
+					return policyv1alpha2.ResponseChunkAction{Body: p.buildSSEErrorEvent(reason, rp)}
+				}
+			} else if count >= rp.Min && count <= rp.Max {
+				reason := fmt.Sprintf("sentence count %d is within the excluded range %d-%d sentences", count, rp.Min, rp.Max)
+				return policyv1alpha2.ResponseChunkAction{Body: p.buildSSEErrorEvent(reason, rp)}
+			}
 			return policyv1alpha2.ResponseChunkAction{}
 		}
 		result := p.validatePayloadV2([]byte(full), p.responseParams, true)
