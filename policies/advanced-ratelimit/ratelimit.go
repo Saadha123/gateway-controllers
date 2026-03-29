@@ -438,6 +438,18 @@ const (
 	rateLimitStreamStateKey   = "ratelimit:stream_state"   // Per-request SSE/JSON streaming accumulation state
 )
 
+// upstreamRateLimitHeaders are provider-specific rate-limit headers that should
+// never be forwarded to API consumers. They leak upstream quota details, conflict
+// with gateway-issued ratelimit headers, and pollute the x-ratelimit-* namespace.
+var upstreamRateLimitHeaders = []string{
+	"x-ratelimit-limit-requests",
+	"x-ratelimit-limit-tokens",
+	"x-ratelimit-remaining-requests",
+	"x-ratelimit-remaining-tokens",
+	"x-ratelimit-reset-requests",
+	"x-ratelimit-reset-tokens",
+}
+
 // quotaResult stores the result of checking a single quota
 type quotaResult struct {
 	QuotaName string
@@ -982,6 +994,28 @@ func (p *RateLimitPolicy) hasStreamingResponseSourceForQuota(q *QuotaRuntime) bo
 		return false
 	}
 	return q.CostExtractor.HasResponsePhaseSources()
+}
+
+// isStreamingResponse returns true if the upstream response headers indicate a streaming
+// body — either Server-Sent Events (content-type: text/event-stream) or chunked transfer
+// encoding. These are the same signals the kernel uses to activate FULL_DUPLEX_STREAMED
+// mode, which routes body data through OnResponseBodyChunk instead of OnResponseBody and
+// commits response headers before the first chunk arrives.
+func isStreamingResponse(headers *policy.Headers) bool {
+	if headers == nil {
+		return false
+	}
+	ct := headers.Get("content-type")
+	if len(ct) > 0 && strings.Contains(ct[0], "text/event-stream") {
+		return true
+	}
+	te := headers.Get("transfer-encoding")
+	for _, v := range te {
+		if strings.Contains(strings.ToLower(v), "chunked") {
+			return true
+		}
+	}
+	return false
 }
 
 // getLimitFromQuota returns the limit from a quota's first limit config, or 0 if none
@@ -1611,6 +1645,12 @@ func (p *RateLimitPolicy) OnResponseHeaders(ctx context.Context, respCtx *policy
 		}
 	}
 
+	// Detect whether the upstream response is streaming (SSE or chunked transfer).
+	// The kernel activates FULL_DUPLEX_STREAMED mode under the same conditions, which
+	// means OnResponseBodyChunk will be used instead of OnResponseBody, and response
+	// headers will be committed before any body chunks arrive.
+	isStreaming := isStreamingResponse(respCtx.ResponseHeaders)
+
 	// Retrieve stored results from request phase
 	resultsRaw, hasResults := respCtx.Metadata[rateLimitResultKey]
 	var storedResults []quotaResult
@@ -1737,9 +1777,39 @@ func (p *RateLimitPolicy) OnResponseHeaders(ctx context.Context, respCtx *policy
 				Duration:  result.Duration,
 			})
 		} else {
-			// Use stored result from request phase
+			// Use stored result from request phase.
 			if stored, ok := storedResultsMap[quotaName]; ok && stored.Result != nil {
 				allQuotaResults = append(allQuotaResults, stored)
+			} else if isStreaming {
+				// stored.Result is nil (pre-check placeholder) AND the response is
+				// streaming (SSE / chunked). Response headers are committed to the client
+				// before the first body chunk arrives, so OnResponseBodyChunk /
+				// finalizeAndConsumeStreamingCosts cannot update them. Use GetAvailable
+				// to produce a pre-consumption snapshot so the client sees useful
+				// rate-limit information. The value reflects remaining BEFORE this
+				// request's token cost is deducted; it decreases correctly across
+				// successive requests as each EOS deduction is applied.
+				// For buffered responses this branch is intentionally skipped —
+				// OnResponseBody will set accurate post-consumption values instead.
+				key := quotaKeys[quotaName]
+				if key != "" {
+					available, err := q.Limiter.GetAvailable(context.Background(), key)
+					if err == nil {
+						duration := getDurationFromQuota(q)
+						allQuotaResults = append(allQuotaResults, quotaResult{
+							QuotaName: quotaName,
+							Result: &limiter.Result{
+								Allowed:   available > 0,
+								Limit:     getLimitFromQuota(q),
+								Remaining: available,
+								Reset:     time.Now().Add(duration),
+								Duration:  duration,
+							},
+							Key:      key,
+							Duration: duration,
+						})
+					}
+				}
 			}
 		}
 	}
@@ -1748,11 +1818,12 @@ func (p *RateLimitPolicy) OnResponseHeaders(ctx context.Context, respCtx *policy
 	// quota results and avoid re-consuming them.
 	respCtx.Metadata[rateLimitResultKey] = allQuotaResults
 
-	// Only build rate limit headers here if OnResponseBody will not run.
-	// If body/metadata sources exist, OnResponseBody will process those quotas
-	// and emit the final complete headers — building partial headers here would
-	// be incorrect and they would be overwritten anyway.
-	if p.requiresAnyResponseBodyMode() {
+	// For buffered responses with body-phase sources, defer header emission to
+	// OnResponseBody which has the full body and can report accurate post-consumption
+	// remaining. For streaming responses, headers are already committed by the time
+	// chunks arrive so we must emit them here using the pre-consumption snapshot built
+	// above — skip the early return in that case.
+	if p.requiresAnyResponseBodyMode() && !isStreaming {
 		return nil
 	}
 
@@ -1766,7 +1837,8 @@ func (p *RateLimitPolicy) OnResponseHeaders(ctx context.Context, respCtx *policy
 	}
 
 	return policy.DownstreamResponseHeaderModifications{
-		HeadersToSet: headers,
+		HeadersToSet:    headers,
+		HeadersToRemove: upstreamRateLimitHeaders,
 	}
 }
 
@@ -1939,10 +2011,13 @@ func (p *RateLimitPolicy) OnResponseBody(ctx context.Context, respCtx *policy.Re
 		}
 
 		return policy.DownstreamResponseModifications{
-			HeadersToSet: headers,
+			HeadersToSet:    headers,
+			HeadersToRemove: upstreamRateLimitHeaders,
 		}
 	}
-	return policy.DownstreamResponseModifications{}
+	return policy.DownstreamResponseModifications{
+		HeadersToRemove: upstreamRateLimitHeaders,
+	}
 }
 
 func (p *RateLimitPolicy) extractQuotaKey(reqCtx *policy.RequestContext, q *QuotaRuntime) string {
