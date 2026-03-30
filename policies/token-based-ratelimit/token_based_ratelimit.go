@@ -490,7 +490,12 @@ func (p *TokenBasedRateLimitPolicy) OnResponseBodyChunk(
 		if rl, ok := delegate.(responseChunkPolicer); ok {
 			return rl.OnResponseBodyChunk(ctx, respCtx, chunk, params)
 		}
+		return policy.ResponseChunkAction{}
 	}
+
+	slog.Debug("OnResponseBody: no delegate found for provider",
+		"route", p.metadata.RouteName,
+		"provider", providerName)
 
 	return policy.ResponseChunkAction{}
 }
