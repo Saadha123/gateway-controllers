@@ -606,7 +606,7 @@ func (p *SentenceCountGuardrailPolicy) OnResponseBodyChunk(ctx context.Context, 
 		}
 		result := p.validatePayload([]byte(full), p.responseParams, true)
 		if mod, ok := result.(policy.DownstreamResponseModifications); ok && mod.StatusCode != nil {
-			return policy.TerminateResponseChunk{Body: mod.Body}
+			return policy.ForwardResponseChunk{Body: mod.Body}
 		}
 		return policy.ForwardResponseChunk{}
 	}
